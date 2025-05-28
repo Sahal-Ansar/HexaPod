@@ -1,0 +1,49 @@
+# ─── Python (Raspberry Pi brain) ────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.installed.cfg
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Test / coverage / type-check caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ─── Arduino (Mega firmware) ────────────────────────────────────────────────
+# Arduino IDE / arduino-cli build output
+build/
+*.hex
+*.elf
+*.bin
+.build/
+.cache/
+
+# ─── Runtime / robot artifacts ──────────────────────────────────────────────
+# Local machine-specific config & calibration overrides (commit the templates,
+# not the per-robot tuned values).
+*.local.yaml
+*.local.yml
+calibration.local.*
+logs/
+*.log
+
+# ─── Editors / OS ───────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini

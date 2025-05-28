@@ -1,0 +1,10 @@
+# Raspberry Pi brain dependencies.
+# Install on the Pi (or your laptop for offline testing) with:
+#   python -m pip install -r requirements.txt
+
+pyserial>=3.5      # USB serial link to the Arduino Mega
+numpy>=1.24        # vector math for kinematics / gait
+PyYAML>=6.0        # load robot config & calibration from YAML
+
+# --- development / offline testing (optional) ---
+pytest>=7.0        # IK/FK round-trip and gait unit tests
