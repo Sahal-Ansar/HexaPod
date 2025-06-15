@@ -42,9 +42,20 @@ static const uint32_t SERIAL_BAUD = 115200;
 // 50 Hz (and therefore our microsecond pulse widths) come out accurate.
 static const uint32_t PCA_OSC_HZ = 27000000;
 
+// ── Servo addressing & pulse limits (must match the Pi protocol) ────────────
+static const uint8_t  NUM_SERVOS       = 18;   // 6 legs × 3 joints
+static const uint8_t  SERVOS_PER_BOARD = 9;    // global index < 9 -> board 0
+static const uint16_t SERVO_MIN_US     = 500;  // hard safety clamp (stops)
+static const uint16_t SERVO_MAX_US     = 2500;
+static const uint16_t NEUTRAL_PULSE_US = 1500; // boot-safe "all centred" pose
+
 // Two driver objects, one per board.
 Adafruit_PWMServoDriver pca0 = Adafruit_PWMServoDriver(PCA0_ADDR);
 Adafruit_PWMServoDriver pca1 = Adafruit_PWMServoDriver(PCA1_ADDR);
+
+// Last microsecond pulse commanded to each servo (index 0..17). Kept so we can
+// inspect/echo current state and so a future failsafe knows the last pose.
+static uint16_t servoUs[NUM_SERVOS];
 
 // Heartbeat LED state.
 static uint32_t lastBlinkMs = 0;
@@ -55,6 +66,43 @@ static void initPca(Adafruit_PWMServoDriver &pca) {
   pca.begin();
   pca.setOscillatorFrequency(PCA_OSC_HZ);
   pca.setPWMFreq(SERVO_FREQ);
+}
+
+// Convert a servo pulse width (microseconds) to a PCA9685 12-bit "off" count.
+// The chip divides each PWM period into 4096 ticks, so:
+//   period_us = 1e6 / SERVO_FREQ           (20000 us at 50 Hz)
+//   ticks     = us / period_us * 4096      = us * 4096 * SERVO_FREQ / 1e6
+// e.g. 1500 us -> 307 ticks (= 1499 us back), matching Adafruit's servo range.
+static inline uint16_t usToTicks(uint16_t us) {
+  uint32_t ticks = ((uint32_t)us * 4096UL * SERVO_FREQ) / 1000000UL;
+  if (ticks > 4095UL) ticks = 4095UL;
+  return (uint16_t)ticks;
+}
+
+// Drive one servo by global index (0..17). Maps index -> (board, channel) with
+// the same rule the Pi uses (board = index / 9, channel = index % 9) and clamps
+// the pulse to the safe window as a last line of defence against bad commands.
+static void writeServoUs(uint8_t index, uint16_t us) {
+  if (index >= NUM_SERVOS) return;
+  if (us < SERVO_MIN_US) us = SERVO_MIN_US;
+  if (us > SERVO_MAX_US) us = SERVO_MAX_US;
+  servoUs[index] = us;
+  const uint16_t ticks = usToTicks(us);
+  if (index < SERVOS_PER_BOARD) {
+    pca0.setPWM(index, 0, ticks);
+  } else {
+    pca1.setPWM(index - SERVOS_PER_BOARD, 0, ticks);
+  }
+}
+
+// Move every servo to the boot-safe centred pose. Staggered with a small delay
+// so 18 servos don't all surge at once and brown out the supply. This runs once
+// at boot; the Pi commands the real calibrated stance after it connects.
+static void startupNeutralPose() {
+  for (uint8_t i = 0; i < NUM_SERVOS; i++) {
+    writeServoUs(i, NEUTRAL_PULSE_US);
+    delay(15);  // boot-only stagger; the runtime command path never delays
+  }
 }
 
 void setup() {
@@ -69,8 +117,11 @@ void setup() {
   initPca(pca0);
   initPca(pca1);
 
+  // Bring all servos to a known centred pose before anything else commands them.
+  startupNeutralPose();
+
   // Banner so you can see the firmware booted (open the Serial Monitor @115200).
-  Serial.println(F("HexaPod Mega firmware: stage 11 (PCA9685 + I2C + serial up)"));
+  Serial.println(F("HexaPod Mega firmware: stage 12 (servo write + neutral pose)"));
 }
 
 void loop() {
