@@ -31,6 +31,8 @@
 #include <Wire.h>
 #include <Adafruit_PWMServoDriver.h>
 
+#include "protocol.h"  // shared Pi<->Arduino frame format + CRC
+
 // ── Configuration ───────────────────────────────────────────────────────────
 static const uint8_t  PCA0_ADDR  = 0x40;   // board 0 (left legs)
 static const uint8_t  PCA1_ADDR  = 0x41;   // board 1 (right legs)
@@ -60,6 +62,25 @@ static uint16_t servoUs[NUM_SERVOS];
 // Heartbeat LED state.
 static uint32_t lastBlinkMs = 0;
 static bool     ledOn       = false;
+
+// Timestamp (ms) of the last valid servo command — a later stage uses this to
+// failsafe (hold/relax) if the Pi stops talking.
+static uint32_t lastCommandMs = 0;
+
+// ── Incoming-frame parser state machine ─────────────────────────────────────
+// Serial bytes dribble in a few at a time, so we parse incrementally in loop()
+// (never blocking). Mirrors the Pi's FrameParser: lock onto the sync bytes,
+// read TYPE/LEN/PAYLOAD, verify CRC, then dispatch.
+enum RxState {
+  RX_SYNC0, RX_SYNC1, RX_TYPE, RX_LEN, RX_PAYLOAD, RX_CRC
+};
+static const uint8_t RX_MAX_PAYLOAD = 64;  // >= largest payload (36)
+static uint8_t  rxState   = RX_SYNC0;
+static uint8_t  rxType    = 0;
+static uint8_t  rxLen     = 0;
+static uint8_t  rxIndex   = 0;
+static uint8_t  rxCrc     = 0;             // running CRC over TYPE/LEN/PAYLOAD
+static uint8_t  rxBuf[RX_MAX_PAYLOAD];
 
 // Initialise one PCA9685 board to a known, accurate 50 Hz state.
 static void initPca(Adafruit_PWMServoDriver &pca) {
@@ -105,6 +126,65 @@ static void startupNeutralPose() {
   }
 }
 
+// Apply a validated servo-command frame: 18 little-endian uint16 microsecond
+// pulses, in global servo-index order, straight to the servos.
+static void handleServoFrame(const uint8_t *payload, uint8_t len) {
+  if (len != SERVO_PAYLOAD_LEN) return;  // wrong size for this type — ignore
+  for (uint8_t i = 0; i < NUM_SERVOS; i++) {
+    const uint16_t us = (uint16_t)payload[2 * i] | ((uint16_t)payload[2 * i + 1] << 8);
+    writeServoUs(i, us);
+  }
+  lastCommandMs = millis();
+}
+
+// Dispatch a CRC-validated frame by type.
+static void handleFrame(uint8_t type, const uint8_t *payload, uint8_t len) {
+  switch (type) {
+    case MSG_SERVO: handleServoFrame(payload, len); break;
+    default: break;  // unknown/other types ignored for forward-compatibility
+  }
+}
+
+// Feed all currently-available serial bytes through the parser state machine.
+static void parseSerial() {
+  while (Serial.available() > 0) {
+    const uint8_t b = (uint8_t)Serial.read();
+    switch (rxState) {
+      case RX_SYNC0:
+        if (b == SYNC0) rxState = RX_SYNC1;
+        break;
+      case RX_SYNC1:
+        // Accept AA..AA55 runs; any other byte means this wasn't a frame start.
+        if (b == SYNC1)      rxState = RX_TYPE;
+        else if (b == SYNC0) rxState = RX_SYNC1;
+        else                 rxState = RX_SYNC0;
+        break;
+      case RX_TYPE:
+        rxType = b;
+        rxCrc = crc8_update(0, b);  // CRC starts at TYPE
+        rxState = RX_LEN;
+        break;
+      case RX_LEN:
+        rxLen = b;
+        rxCrc = crc8_update(rxCrc, b);
+        rxIndex = 0;
+        if (rxLen > RX_MAX_PAYLOAD) rxState = RX_SYNC0;       // bogus length: resync
+        else if (rxLen == 0)        rxState = RX_CRC;
+        else                        rxState = RX_PAYLOAD;
+        break;
+      case RX_PAYLOAD:
+        rxBuf[rxIndex++] = b;
+        rxCrc = crc8_update(rxCrc, b);
+        if (rxIndex >= rxLen) rxState = RX_CRC;
+        break;
+      case RX_CRC:
+        if (b == rxCrc) handleFrame(rxType, rxBuf, rxLen);
+        rxState = RX_SYNC0;  // good or bad, hunt for the next frame
+        break;
+    }
+  }
+}
+
 void setup() {
   Serial.begin(SERIAL_BAUD);
 
@@ -121,12 +201,15 @@ void setup() {
   startupNeutralPose();
 
   // Banner so you can see the firmware booted (open the Serial Monitor @115200).
-  Serial.println(F("HexaPod Mega firmware: stage 12 (servo write + neutral pose)"));
+  Serial.println(F("HexaPod Mega firmware: stage 13 (serial parser + 18 servos)"));
 }
 
 void loop() {
-  // Heartbeat: blink the on-board LED at 2 Hz to prove the loop is running.
-  // Non-blocking (millis-based) so it never stalls future serial handling.
+  // 1) Drain and parse any incoming servo commands (drives the servos).
+  parseSerial();
+
+  // 2) Heartbeat: blink the on-board LED at 2 Hz to prove the loop is running.
+  // Non-blocking (millis-based) so it never stalls serial handling.
   const uint32_t now = millis();
   if (now - lastBlinkMs >= 250) {
     lastBlinkMs = now;
