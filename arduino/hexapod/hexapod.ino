@@ -51,6 +51,15 @@ static const uint16_t SERVO_MIN_US     = 500;  // hard safety clamp (stops)
 static const uint16_t SERVO_MAX_US     = 2500;
 static const uint16_t NEUTRAL_PULSE_US = 1500; // boot-safe "all centred" pose
 
+// ── HC-SR04 ultrasonic (front-facing) ───────────────────────────────────────
+static const uint8_t  SONAR_TRIG_PIN    = 7;     // any digital output
+static const uint8_t  SONAR_ECHO_PIN    = 2;     // MUST be interrupt-capable
+                                                 //   (Mega: 2,3,18,19 — NOT the
+                                                 //   I2C pins 20/21)
+static const uint16_t SONAR_PING_MS     = 50;    // re-trigger every 50 ms (~20 Hz)
+static const uint16_t SONAR_TIMEOUT_MS  = 30;    // no echo in 30 ms => out of range
+static const uint32_t SONAR_MAX_ECHO_US = 25000; // ~4.3 m ceiling
+
 // Two driver objects, one per board.
 Adafruit_PWMServoDriver pca0 = Adafruit_PWMServoDriver(PCA0_ADDR);
 Adafruit_PWMServoDriver pca1 = Adafruit_PWMServoDriver(PCA1_ADDR);
@@ -185,6 +194,66 @@ static void parseSerial() {
   }
 }
 
+// ── HC-SR04: interrupt-driven, non-blocking distance measurement ────────────
+// pulseIn() would block the loop for up to ~23 ms per ping — far too long for a
+// 20 ms control tick. Instead we fire a 10 us trigger pulse on a timer and let a
+// pin-change interrupt time the echo, so the main loop is never stalled.
+volatile uint32_t sonarRiseUs  = 0;
+volatile uint16_t sonarDistMm  = DISTANCE_NO_ECHO;
+volatile bool     sonarRising  = false;
+volatile bool     sonarGotEcho = true;   // true => not currently awaiting an echo
+static   uint32_t lastSonarTrig = 0;     // loop time of last trigger
+static   uint32_t sonarPingMs   = 0;     // when the outstanding ping was sent
+
+// Echo pin CHANGE interrupt: stamp the rising edge, time the width on falling.
+// distance_mm = duration_us * 10 / 58  (datasheet: 58 us of round trip per cm).
+void sonarEchoIsr() {
+  if (digitalRead(SONAR_ECHO_PIN)) {
+    sonarRiseUs = micros();
+    sonarRising = true;
+  } else if (sonarRising) {
+    const uint32_t dur = micros() - sonarRiseUs;
+    sonarRising = false;
+    sonarDistMm = (dur <= SONAR_MAX_ECHO_US) ? (uint16_t)((dur * 10UL) / 58UL)
+                                             : DISTANCE_NO_ECHO;
+    sonarGotEcho = true;
+  }
+}
+
+static void sonarTrigger() {
+  digitalWrite(SONAR_TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(SONAR_TRIG_PIN, HIGH);
+  delayMicroseconds(10);          // 10 us trigger; negligible vs. the loop
+  digitalWrite(SONAR_TRIG_PIN, LOW);
+  sonarGotEcho = false;
+  sonarPingMs = millis();
+}
+
+// Atomic read — a 16-bit load isn't atomic on the 8-bit AVR, so guard it.
+static uint16_t sonarReadMm() {
+  uint16_t v;
+  noInterrupts();
+  v = sonarDistMm;
+  interrupts();
+  return v;
+}
+
+// Call every loop: schedule pings and force "no echo" if one never returns.
+static void sonarUpdate() {
+  const uint32_t now = millis();
+  if (now - lastSonarTrig >= SONAR_PING_MS) {
+    lastSonarTrig = now;
+    sonarTrigger();
+  }
+  if (!sonarGotEcho && (now - sonarPingMs) > SONAR_TIMEOUT_MS) {
+    noInterrupts();
+    sonarDistMm = DISTANCE_NO_ECHO;   // nothing in range / no surface to bounce off
+    sonarGotEcho = true;
+    interrupts();
+  }
+}
+
 void setup() {
   Serial.begin(SERIAL_BAUD);
 
@@ -200,20 +269,35 @@ void setup() {
   // Bring all servos to a known centred pose before anything else commands them.
   startupNeutralPose();
 
+  // HC-SR04 wiring + echo interrupt.
+  pinMode(SONAR_TRIG_PIN, OUTPUT);
+  digitalWrite(SONAR_TRIG_PIN, LOW);
+  pinMode(SONAR_ECHO_PIN, INPUT);
+  attachInterrupt(digitalPinToInterrupt(SONAR_ECHO_PIN), sonarEchoIsr, CHANGE);
+
   // Banner so you can see the firmware booted (open the Serial Monitor @115200).
-  Serial.println(F("HexaPod Mega firmware: stage 13 (serial parser + 18 servos)"));
+  Serial.println(F("HexaPod Mega firmware: stage 14 (HC-SR04 distance)"));
 }
 
 void loop() {
   // 1) Drain and parse any incoming servo commands (drives the servos).
   parseSerial();
 
-  // 2) Heartbeat: blink the on-board LED at 2 Hz to prove the loop is running.
+  // 2) Keep the ultrasonic ranging in the background (non-blocking).
+  sonarUpdate();
+
+  // 3) Heartbeat: blink the on-board LED at 2 Hz to prove the loop is running.
   // Non-blocking (millis-based) so it never stalls serial handling.
   const uint32_t now = millis();
   if (now - lastBlinkMs >= 250) {
     lastBlinkMs = now;
     ledOn = !ledOn;
     digitalWrite(LED_BUILTIN, ledOn ? HIGH : LOW);
+
+    // TEMPORARY bench diagnostic — replaced by the binary telemetry packet in
+    // stage 17. Lets you confirm the HC-SR04 reads sensible distances now.
+    const uint16_t d = sonarReadMm();
+    Serial.print(F("dist_mm="));
+    Serial.println(d == DISTANCE_NO_ECHO ? -1 : (int)d);
   }
 }
