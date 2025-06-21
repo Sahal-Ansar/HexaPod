@@ -30,6 +30,8 @@
 
 #include <Wire.h>
 #include <Adafruit_PWMServoDriver.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
 
 #include "protocol.h"  // shared Pi<->Arduino frame format + CRC
 
@@ -60,9 +62,22 @@ static const uint16_t SONAR_PING_MS     = 50;    // re-trigger every 50 ms (~20 
 static const uint16_t SONAR_TIMEOUT_MS  = 30;    // no echo in 30 ms => out of range
 static const uint32_t SONAR_MAX_ECHO_US = 25000; // ~4.3 m ceiling
 
+// ── MPU6050 IMU (body tilt) ─────────────────────────────────────────────────
+static const uint16_t IMU_UPDATE_MS = 10;     // run the filter at ~100 Hz
+static const float    COMP_ALPHA    = 0.98f;  // complementary-filter weight
+
 // Two driver objects, one per board.
 Adafruit_PWMServoDriver pca0 = Adafruit_PWMServoDriver(PCA0_ADDR);
 Adafruit_PWMServoDriver pca1 = Adafruit_PWMServoDriver(PCA1_ADDR);
+
+// IMU object + filtered body angles (degrees). roll = tilt about +X (forward),
+// pitch = tilt about +Y (left), matching the Pi's body-frame convention.
+Adafruit_MPU6050 mpu;
+static bool     imuOk        = false;
+static float    imuRollDeg   = 0.0f;
+static float    imuPitchDeg  = 0.0f;
+static uint32_t imuLastUs    = 0;   // micros() of last filter step (for dt)
+static uint32_t imuLastMs    = 0;   // millis() of last filter step (throttle)
 
 // Last microsecond pulse commanded to each servo (index 0..17). Kept so we can
 // inspect/echo current state and so a future failsafe knows the last pose.
@@ -254,6 +269,41 @@ static void sonarUpdate() {
   }
 }
 
+// ── MPU6050: complementary filter for roll & pitch ──────────────────────────
+// The accelerometer gives an absolute tilt but is noisy and corrupted by the
+// robot's own motion; the gyro gives a clean rate but its integral drifts. The
+// complementary filter trusts the gyro over the short term and gently pulls
+// back toward the accelerometer over the long term:
+//   angle = A*(angle + gyro_rate*dt) + (1-A)*accel_angle      (A ≈ 0.98)
+// It is the cheap, rock-solid choice for body leveling (a full Kalman filter is
+// overkill for slow tilt).
+static void imuUpdate() {
+  const uint32_t nowMs = millis();
+  if (!imuOk || (nowMs - imuLastMs) < IMU_UPDATE_MS) return;
+  imuLastMs = nowMs;
+
+  sensors_event_t accel, gyro, temp;
+  mpu.getEvent(&accel, &gyro, &temp);
+
+  const uint32_t nowUs = micros();
+  float dt = (nowUs - imuLastUs) * 1e-6f;
+  imuLastUs = nowUs;
+  if (dt <= 0.0f || dt > 0.5f) dt = IMU_UPDATE_MS * 1e-3f;  // guard 1st call/wrap
+
+  // Absolute tilt from gravity (accel in m/s^2).
+  const float ay = accel.acceleration.y, az = accel.acceleration.z;
+  const float ax = accel.acceleration.x;
+  const float rollAcc  = atan2f(ay, az) * RAD_TO_DEG;
+  const float pitchAcc = atan2f(-ax, sqrtf(ay * ay + az * az)) * RAD_TO_DEG;
+
+  // Angular rate from the gyro (Adafruit reports rad/s) -> deg/s.
+  const float rollRate  = gyro.gyro.x * RAD_TO_DEG;
+  const float pitchRate = gyro.gyro.y * RAD_TO_DEG;
+
+  imuRollDeg  = COMP_ALPHA * (imuRollDeg  + rollRate  * dt) + (1.0f - COMP_ALPHA) * rollAcc;
+  imuPitchDeg = COMP_ALPHA * (imuPitchDeg + pitchRate * dt) + (1.0f - COMP_ALPHA) * pitchAcc;
+}
+
 void setup() {
   Serial.begin(SERIAL_BAUD);
 
@@ -275,8 +325,19 @@ void setup() {
   pinMode(SONAR_ECHO_PIN, INPUT);
   attachInterrupt(digitalPinToInterrupt(SONAR_ECHO_PIN), sonarEchoIsr, CHANGE);
 
+  // MPU6050 IMU (shares the I2C bus, default address 0x68).
+  imuOk = mpu.begin();
+  if (imuOk) {
+    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+    imuLastUs = micros();
+  } else {
+    Serial.println(F("WARN: MPU6050 not found — roll/pitch will read 0"));
+  }
+
   // Banner so you can see the firmware booted (open the Serial Monitor @115200).
-  Serial.println(F("HexaPod Mega firmware: stage 14 (HC-SR04 distance)"));
+  Serial.println(F("HexaPod Mega firmware: stage 15 (MPU6050 roll/pitch)"));
 }
 
 void loop() {
@@ -286,7 +347,10 @@ void loop() {
   // 2) Keep the ultrasonic ranging in the background (non-blocking).
   sonarUpdate();
 
-  // 3) Heartbeat: blink the on-board LED at 2 Hz to prove the loop is running.
+  // 3) Keep the IMU filter running (throttled to ~100 Hz internally).
+  imuUpdate();
+
+  // 4) Heartbeat: blink the on-board LED at 2 Hz to prove the loop is running.
   // Non-blocking (millis-based) so it never stalls serial handling.
   const uint32_t now = millis();
   if (now - lastBlinkMs >= 250) {
@@ -295,9 +359,13 @@ void loop() {
     digitalWrite(LED_BUILTIN, ledOn ? HIGH : LOW);
 
     // TEMPORARY bench diagnostic — replaced by the binary telemetry packet in
-    // stage 17. Lets you confirm the HC-SR04 reads sensible distances now.
+    // stage 17. Confirms the HC-SR04 distance and MPU6050 tilt read sensibly.
     const uint16_t d = sonarReadMm();
     Serial.print(F("dist_mm="));
-    Serial.println(d == DISTANCE_NO_ECHO ? -1 : (int)d);
+    Serial.print(d == DISTANCE_NO_ECHO ? -1 : (int)d);
+    Serial.print(F(" roll="));
+    Serial.print(imuRollDeg, 1);
+    Serial.print(F(" pitch="));
+    Serial.println(imuPitchDeg, 1);
   }
 }
