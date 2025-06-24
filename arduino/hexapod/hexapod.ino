@@ -47,6 +47,7 @@ static const uint32_t SERIAL_BAUD = 115200;
 static const uint32_t PCA_OSC_HZ = 27000000;
 
 // ── Servo addressing & pulse limits (must match the Pi protocol) ────────────
+static const uint8_t  NUM_LEGS         = 6;
 static const uint8_t  NUM_SERVOS       = 18;   // 6 legs × 3 joints
 static const uint8_t  SERVOS_PER_BOARD = 9;    // global index < 9 -> board 0
 static const uint16_t SERVO_MIN_US     = 500;  // hard safety clamp (stops)
@@ -66,6 +67,12 @@ static const uint32_t SONAR_MAX_ECHO_US = 25000; // ~4.3 m ceiling
 static const uint16_t IMU_UPDATE_MS = 10;     // run the filter at ~100 Hz
 static const float    COMP_ALPHA    = 0.98f;  // complementary-filter weight
 
+// ── Foot-contact limit switches (one per leg, indexed by LegId 0..5) ────────
+// Wired pin -> GND and read with the internal pull-up, so an open (foot up)
+// switch reads HIGH and a closed (foot planted) switch reads LOW.
+static const uint8_t  FOOT_PINS[NUM_LEGS] = {30, 31, 32, 33, 34, 35};
+static const uint16_t FOOT_DEBOUNCE_MS    = 5;  // ignore contact bounce shorter than this
+
 // Two driver objects, one per board.
 Adafruit_PWMServoDriver pca0 = Adafruit_PWMServoDriver(PCA0_ADDR);
 Adafruit_PWMServoDriver pca1 = Adafruit_PWMServoDriver(PCA1_ADDR);
@@ -82,6 +89,11 @@ static uint32_t imuLastMs    = 0;   // millis() of last filter step (throttle)
 // Last microsecond pulse commanded to each servo (index 0..17). Kept so we can
 // inspect/echo current state and so a future failsafe knows the last pose.
 static uint16_t servoUs[NUM_SERVOS];
+
+// Foot-contact debounce state, per leg.
+static uint8_t  footRaw[NUM_LEGS];        // most recent raw reading (1 = pressed)
+static uint8_t  footStable[NUM_LEGS];     // debounced contact state (1 = planted)
+static uint32_t footChangeMs[NUM_LEGS];   // when footRaw last changed
 
 // Heartbeat LED state.
 static uint32_t lastBlinkMs = 0;
@@ -304,6 +316,33 @@ static void imuUpdate() {
   imuPitchDeg = COMP_ALPHA * (imuPitchDeg + pitchRate * dt) + (1.0f - COMP_ALPHA) * pitchAcc;
 }
 
+// ── Foot-contact limit switches: time-based debounce ────────────────────────
+// A mechanical switch chatters for a few ms when it makes/breaks contact. We
+// only accept a new state once the raw reading has held steady for
+// FOOT_DEBOUNCE_MS, so a single touchdown registers as one clean event instead
+// of a burst. Non-blocking: just timestamps, no delay().
+static void footUpdate() {
+  const uint32_t now = millis();
+  for (uint8_t i = 0; i < NUM_LEGS; i++) {
+    const uint8_t raw = (digitalRead(FOOT_PINS[i]) == LOW) ? 1 : 0;  // LOW = pressed
+    if (raw != footRaw[i]) {
+      footRaw[i] = raw;
+      footChangeMs[i] = now;            // reading changed -> restart debounce timer
+    } else if ((now - footChangeMs[i]) >= FOOT_DEBOUNCE_MS) {
+      footStable[i] = raw;              // held steady long enough -> commit it
+    }
+  }
+}
+
+// Pack the six debounced contact states into one byte: bit i = leg i planted.
+static uint8_t footContactByte() {
+  uint8_t b = 0;
+  for (uint8_t i = 0; i < NUM_LEGS; i++) {
+    if (footStable[i]) b |= (uint8_t)(1 << i);
+  }
+  return b;
+}
+
 void setup() {
   Serial.begin(SERIAL_BAUD);
 
@@ -336,8 +375,16 @@ void setup() {
     Serial.println(F("WARN: MPU6050 not found — roll/pitch will read 0"));
   }
 
+  // Foot-contact limit switches (internal pull-ups; pressed = LOW).
+  for (uint8_t i = 0; i < NUM_LEGS; i++) {
+    pinMode(FOOT_PINS[i], INPUT_PULLUP);
+    footRaw[i] = (digitalRead(FOOT_PINS[i]) == LOW) ? 1 : 0;
+    footStable[i] = footRaw[i];
+    footChangeMs[i] = millis();
+  }
+
   // Banner so you can see the firmware booted (open the Serial Monitor @115200).
-  Serial.println(F("HexaPod Mega firmware: stage 15 (MPU6050 roll/pitch)"));
+  Serial.println(F("HexaPod Mega firmware: stage 16 (foot-contact switches)"));
 }
 
 void loop() {
@@ -350,7 +397,10 @@ void loop() {
   // 3) Keep the IMU filter running (throttled to ~100 Hz internally).
   imuUpdate();
 
-  // 4) Heartbeat: blink the on-board LED at 2 Hz to prove the loop is running.
+  // 4) Debounce the foot-contact switches.
+  footUpdate();
+
+  // 5) Heartbeat: blink the on-board LED at 2 Hz to prove the loop is running.
   // Non-blocking (millis-based) so it never stalls serial handling.
   const uint32_t now = millis();
   if (now - lastBlinkMs >= 250) {
@@ -359,13 +409,18 @@ void loop() {
     digitalWrite(LED_BUILTIN, ledOn ? HIGH : LOW);
 
     // TEMPORARY bench diagnostic — replaced by the binary telemetry packet in
-    // stage 17. Confirms the HC-SR04 distance and MPU6050 tilt read sensibly.
+    // stage 17. Confirms distance, tilt, and foot-contact bits read sensibly.
     const uint16_t d = sonarReadMm();
     Serial.print(F("dist_mm="));
     Serial.print(d == DISTANCE_NO_ECHO ? -1 : (int)d);
     Serial.print(F(" roll="));
     Serial.print(imuRollDeg, 1);
     Serial.print(F(" pitch="));
-    Serial.println(imuPitchDeg, 1);
+    Serial.print(imuPitchDeg, 1);
+    Serial.print(F(" contacts="));
+    for (uint8_t i = 0; i < NUM_LEGS; i++) {
+      Serial.print((footStable[i]) ? '1' : '0');
+    }
+    Serial.println();
   }
 }
