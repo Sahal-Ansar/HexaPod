@@ -6,9 +6,13 @@
  * drives the servos, and it streams sensor telemetry (ultrasonic distance, IMU
  * roll/pitch, foot-contact switches) back to the Pi.
  *
- * This file is built up over several stages. STAGE 11 (this commit) is just the
- * hardware bring-up: I2C, both PCA9685 PWM boards, and the serial port, plus a
- * heartbeat LED so you can confirm the board is alive before anything else.
+ * Main loop each pass (all non-blocking):
+ *   1. parse incoming servo-command frames -> drive the 18 servos
+ *   2. run the ultrasonic ranging (interrupt-timed echo)
+ *   3. run the IMU complementary filter (roll/pitch)
+ *   4. debounce the foot-contact switches
+ *   5. stream a telemetry frame back to the Pi at 50 Hz
+ *   6. blink a heartbeat LED
  *
  * ── Hardware / wiring ───────────────────────────────────────────────────────
  *   Servos      : 18× MG996R, 9 per PCA9685 board (channels 0..8 used).
@@ -22,7 +26,7 @@
  * ── Build ───────────────────────────────────────────────────────────────────
  *   Libraries (Arduino IDE Library Manager, or `arduino-cli lib install`):
  *     - "Adafruit PWM Servo Driver Library"
- *     - "Adafruit MPU6050" + "Adafruit Unified Sensor"   (added later stage)
+ *     - "Adafruit MPU6050" + "Adafruit Unified Sensor"
  *   Compile/upload (CLI):
  *     arduino-cli compile --fqbn arduino:avr:mega arduino/hexapod
  *     arduino-cli upload  --fqbn arduino:avr:mega -p <PORT> arduino/hexapod
@@ -73,6 +77,9 @@ static const float    COMP_ALPHA    = 0.98f;  // complementary-filter weight
 static const uint8_t  FOOT_PINS[NUM_LEGS] = {30, 31, 32, 33, 34, 35};
 static const uint16_t FOOT_DEBOUNCE_MS    = 5;  // ignore contact bounce shorter than this
 
+// ── Telemetry ───────────────────────────────────────────────────────────────
+static const uint16_t TELEMETRY_PERIOD_MS = 20;  // stream back to the Pi at 50 Hz
+
 // Two driver objects, one per board.
 Adafruit_PWMServoDriver pca0 = Adafruit_PWMServoDriver(PCA0_ADDR);
 Adafruit_PWMServoDriver pca1 = Adafruit_PWMServoDriver(PCA1_ADDR);
@@ -98,6 +105,9 @@ static uint32_t footChangeMs[NUM_LEGS];   // when footRaw last changed
 // Heartbeat LED state.
 static uint32_t lastBlinkMs = 0;
 static bool     ledOn       = false;
+
+// Telemetry scheduling.
+static uint32_t lastTelemetryMs = 0;
 
 // Timestamp (ms) of the last valid servo command — a later stage uses this to
 // failsafe (hold/relax) if the Pi stops talking.
@@ -343,6 +353,36 @@ static uint8_t footContactByte() {
   return b;
 }
 
+// Build and transmit one telemetry frame to the Pi. Payload (little-endian,
+// matching protocol.py decode_telemetry '<HhhB'):
+//   uint16 distance_mm | int16 roll_cdeg | int16 pitch_cdeg | uint8 contacts
+static void sendTelemetry() {
+  const uint16_t dist = sonarReadMm();   // already DISTANCE_NO_ECHO if no echo
+  // Round (not truncate) degrees -> centidegrees so the Pi recovers ±0.005°.
+  const float    rollC  = imuRollDeg  * 100.0f;
+  const float    pitchC = imuPitchDeg * 100.0f;
+  const int16_t  roll   = (int16_t)(rollC  >= 0 ? rollC  + 0.5f : rollC  - 0.5f);
+  const int16_t  pitch  = (int16_t)(pitchC >= 0 ? pitchC + 0.5f : pitchC - 0.5f);
+  const uint8_t  contacts = footContactByte();
+
+  uint8_t frame[2 + 2 + TELEMETRY_PAYLOAD_LEN + 1];
+  frame[0] = SYNC0;
+  frame[1] = SYNC1;
+  frame[2] = MSG_TELEMETRY;
+  frame[3] = TELEMETRY_PAYLOAD_LEN;
+  frame[4] = (uint8_t)(dist  & 0xFF);
+  frame[5] = (uint8_t)(dist  >> 8);
+  frame[6] = (uint8_t)(roll  & 0xFF);
+  frame[7] = (uint8_t)((roll  >> 8) & 0xFF);
+  frame[8] = (uint8_t)(pitch & 0xFF);
+  frame[9] = (uint8_t)((pitch >> 8) & 0xFF);
+  frame[10] = contacts;
+  // CRC over TYPE, LEN, PAYLOAD (frame[2..10]) — not the sync bytes.
+  frame[11] = crc8(&frame[2], 2 + TELEMETRY_PAYLOAD_LEN);
+
+  Serial.write(frame, sizeof(frame));
+}
+
 void setup() {
   Serial.begin(SERIAL_BAUD);
 
@@ -383,8 +423,9 @@ void setup() {
     footChangeMs[i] = millis();
   }
 
-  // Banner so you can see the firmware booted (open the Serial Monitor @115200).
-  Serial.println(F("HexaPod Mega firmware: stage 16 (foot-contact switches)"));
+  // One-time boot banner (ASCII; contains no 0xAA, so the Pi's frame parser
+  // simply skips it before the first binary telemetry frame arrives).
+  Serial.println(F("HexaPod Mega firmware: stage 17 (telemetry streaming)"));
 }
 
 void loop() {
@@ -400,27 +441,20 @@ void loop() {
   // 4) Debounce the foot-contact switches.
   footUpdate();
 
-  // 5) Heartbeat: blink the on-board LED at 2 Hz to prove the loop is running.
-  // Non-blocking (millis-based) so it never stalls serial handling.
   const uint32_t now = millis();
+
+  // 5) Stream the telemetry packet (distance + roll/pitch + contacts) at 50 Hz.
+  if (now - lastTelemetryMs >= TELEMETRY_PERIOD_MS) {
+    lastTelemetryMs = now;
+    sendTelemetry();
+  }
+
+  // 6) Heartbeat: blink the on-board LED at 2 Hz to prove the loop is running.
+  // Non-blocking (millis-based) so it never stalls serial handling. No text on
+  // the serial line now — it carries binary telemetry frames only.
   if (now - lastBlinkMs >= 250) {
     lastBlinkMs = now;
     ledOn = !ledOn;
     digitalWrite(LED_BUILTIN, ledOn ? HIGH : LOW);
-
-    // TEMPORARY bench diagnostic — replaced by the binary telemetry packet in
-    // stage 17. Confirms distance, tilt, and foot-contact bits read sensibly.
-    const uint16_t d = sonarReadMm();
-    Serial.print(F("dist_mm="));
-    Serial.print(d == DISTANCE_NO_ECHO ? -1 : (int)d);
-    Serial.print(F(" roll="));
-    Serial.print(imuRollDeg, 1);
-    Serial.print(F(" pitch="));
-    Serial.print(imuPitchDeg, 1);
-    Serial.print(F(" contacts="));
-    for (uint8_t i = 0; i < NUM_LEGS; i++) {
-      Serial.print((footStable[i]) ? '1' : '0');
-    }
-    Serial.println();
   }
 }
