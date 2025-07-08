@@ -44,6 +44,10 @@ from pi.kinematics.leg_ik import JointAngles
 US_PER_DEG = 2000.0 / 180.0
 SERVO_MIN_US = 500
 SERVO_MAX_US = 2500
+# The pulse the firmware parks every servo at on boot (NEUTRAL_PULSE_US in the
+# Arduino sketch). The Pi uses it as the known starting point for the first
+# smooth move after connecting.
+NEUTRAL_BOOT_PULSE = 1500
 
 
 @dataclass(frozen=True)
