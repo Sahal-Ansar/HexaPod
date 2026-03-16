@@ -1,0 +1,47 @@
+# HexaPod runtime configuration.
+# Loaded by pi/main.py (pass --config <path>, or it auto-loads ./hexapod.yaml).
+# Anything omitted falls back to the in-code defaults. Tune on the real robot.
+
+serial:
+  port: null        # null or "mock" = offline mock Arduino; else "COM5" / "/dev/ttyACM0"
+  baud: 115200
+
+gait:
+  period_s: 1.0     # one full swing+stance cycle
+  step_height_mm: 40
+  duty: 0.5         # stance fraction (0.5 = tripod)
+  max_step_mm: 70   # stride cap (keeps feet inside the workspace)
+
+velocity:           # speed limits + ramp accelerations (teleop feel)
+  max_vx: 120       # mm/s forward/back
+  max_vy: 80        # mm/s strafe
+  max_omega_deg_s: 45
+  accel_lin: 300    # mm/s^2
+  accel_omega: 180  # deg/s^2
+
+leveling:           # IMU body-leveling
+  enabled: true
+  kp: 0.2
+  max_tilt_deg: 12
+  sign: 1           # flip to -1 if the body leans into the slope instead of leveling
+
+contact:            # foot-contact terrain adaptation
+  enabled: true
+  probe_speed_mm_s: 60
+  recover_speed_mm_s: 120
+  max_extend_mm: 30
+
+obstacle:           # ultrasonic detection
+  threshold_mm: 250
+  clear_margin_mm: 80
+  window: 5
+
+avoidance:          # stop-and-turn maneuver
+  turn_deg_s: 45
+  settle_s: 0.4
+  reverse_after_s: 3.0
+  direction: -1     # -1 = turn right, +1 = turn left
+
+standup:
+  sit_height_mm: 35
+  duration_s: 1.5

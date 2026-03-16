@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from typing import Callable, Mapping
 
 from pi.comms.serial_link import SerialLink, open_mock
 from pi.comms.servo_map import DEFAULT_CALIBRATION, CalibrationTable, angles_to_pulses
@@ -57,23 +58,32 @@ class ControlLoop:
         self.config = config
         self.engine = engine or GaitEngine(config=config)
         self.calibration = calibration
-        self.pose = pose                      # body height/leveling (identity for now)
+        self.pose = pose                      # body height/leveling
         self.command = GaitCommand()          # current velocity command
+        # Optional hook applied to the gait's foot targets before IK — used by
+        # the contact adapter (Stage 25) to fold in terrain feedback. Signature:
+        # (targets, dt) -> targets. None = pass through (open-loop).
+        self.target_filter: Callable[[Mapping, float], Mapping] | None = None
         self.tick_count = 0
         self.target_dt = 1.0 / config.control_hz
         self._running = False
 
-    # ── command / pose setters (teleop, leveling, state machine use these) ──
+    # ── command / pose / filter setters (teleop, leveling, contact use these) ──
     def set_command(self, command: GaitCommand) -> None:
         self.command = command
 
     def set_pose(self, pose: BodyPose) -> None:
         self.pose = pose
 
+    def set_target_filter(self, fn: Callable[[Mapping, float], Mapping] | None) -> None:
+        self.target_filter = fn
+
     # ── one control step ──
     def tick(self, dt_s: float) -> TickResult:
         """Run the full pipeline once for an elapsed time of ``dt_s`` seconds."""
         targets = self.engine.update(self.command, dt_s)          # gait
+        if self.target_filter is not None:
+            targets = self.target_filter(targets, dt_s)           # terrain feedback
         angles = solve_body(targets, self.pose, self.config)      # body IK
         pulses = angles_to_pulses(angles, self.calibration)       # calibration
         self.link.send_servos(pulses)                             # -> Arduino
